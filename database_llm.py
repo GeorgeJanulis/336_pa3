@@ -11,7 +11,8 @@ import re
 # 1. SSH/iLab Configuration
 ILAB_USER = "gnj18"  # <-- CHANGE THIS to your NetID
 ILAB_HOST = "ilab.cs.rutgers.edu"
-ILAB_SCRIPT_PATH = "ilab_script.py" 
+# This path must match the location where you uploaded ilab_script.py on iLab
+ILAB_SCRIPT_PATH = "CS336/pa3/ilab_script.py" 
 
 # 2. LLM/Model Configuration
 MODEL_PATH = "./qwen2.5-3b-instruct-q5_k_m.gguf" 
@@ -51,8 +52,8 @@ The user's question MUST be answered using ONLY the provided database schema.
 --- SCHEMA ---
 """
     
-    # Priming the assistant with 'SELECT'
-    prompt = f"<|im_start|>system\n{system_prompt}<|im_end|>\n<|im_start|>user\n{user_question}<|im_end|>\n<|im_start|>assistant\nSELECT"
+    # Do NOT prime the assistant with any text. Let it generate the full query.
+    prompt = f"<|im_start|>system\n{system_prompt}<|im_end|>\n<|im_start|>user\n{user_question}<|im_end|>\n<|im_start|>assistant\n"
     return prompt
 
 def generate_sql(llm, schema_content, user_question):
@@ -62,30 +63,31 @@ def generate_sql(llm, schema_content, user_question):
     output = llm(
         full_prompt,
         max_tokens=256,
-        stop=["<|im_end|>", "\n", ";"],
+        stop=["<|im_end|>"], 
         temperature=0.0,
         echo=False, 
     )
 
     raw_response = output['choices'][0]['text']
     
-    # 1. Use a REGEX to strictly find and capture the actual SELECT statement
-    # This ignores anything the LLM generated before the first 'SELECT' keyword.
-    sql_match = re.search(r"SELECT(.*)", raw_response, re.DOTALL | re.IGNORECASE)
+    # 1. Use REGEX to strictly find and capture the complete SELECT...FROM statement.
+    sql_match = re.search(r"SELECT.*FROM.*", raw_response, re.DOTALL | re.IGNORECASE)
     
     if sql_match:
-        # Extract the matched text (the query starting from SELECT)
         final_sql = sql_match.group(0).strip()
         
-        # 2. Clean up: remove trailing semicolon if present
-        if final_sql.endswith(';'):
-            final_sql = final_sql[:-1]
+        # 2. Clean up: Ensure only one semicolon is at the end
+        final_sql = final_sql.rstrip('; \n\r')
             
-        # 3. Add the semicolon back and clean newlines
+        # 3. CRITICAL FIX: Convert the entire query to lowercase for PostgreSQL compatibility.
+        final_sql = final_sql.lower()
+
+        # 4. Add the semicolon back and clean newlines/spaces
         return f"{final_sql.strip()};".replace('\n', ' ').replace('\r', '')
     
-    # If regex fails (e.g., LLM generated nothing useful), return the raw response for debugging
-    return raw_response.strip().replace('\n', ' ').replace('\r', '')
+    # If regex fails, the LLM likely generated garbage or nothing useful.
+    print(f"⚠️ LLM Output did not contain a valid SELECT...FROM statement: {raw_response.strip()}")
+    return ""
 
 
 def execute_remote_script(sql_query, password):
@@ -113,7 +115,7 @@ def execute_remote_script(sql_query, password):
         # ⚠️ CRITICAL STEP: Write the SQL query to the remote process's stdin
         # This bypasses all complex shell quoting issues.
         stdin.write(sql_query)
-        stdin.close() # Close stdin to signal EOF (End of File) to the remote script
+        stdin.close() 
         
         query_output = stdout.read().decode('utf-8').strip()
         error_output = stderr.read().decode('utf-8').strip()
@@ -166,19 +168,21 @@ def main():
             # 5. Generate SQL
             print("🤖 Generating SQL...")
             sql_query = generate_sql(llm, schema_content, user_question)
+            
+            # Check if the generation step failed to produce a valid-looking query
+            if not sql_query or not sql_query.upper().startswith("SELECT"):
+                print("⚠️ LLM failed to generate a complete SELECT query. Try rephrasing.")
+                continue
+                
             print(f"➡️ Generated SQL: {sql_query}")
 
             # 6. Execute Remote Command
-            if sql_query and sql_query.upper().startswith("SELECT"):
-                results = execute_remote_script(sql_query, ilab_password)
+            results = execute_remote_script(sql_query, ilab_password)
                 
-                if results:
-                    print("\n\n--- 📊 QUERY RESULTS ---")
-                    print(results)
-                    print("-----------------------\n")
-                
-            else:
-                 print("⚠️ LLM did not generate a valid SELECT query. Please try rephrasing.")
+            if results:
+                print("\n\n--- 📊 QUERY RESULTS ---")
+                print(results)
+                print("-----------------------\n")
 
         except EOFError:
             break
